@@ -1,0 +1,16 @@
+# deb, rpm, and apk packages for the supervisor. release.sh fills in ${VERSION} and ${ARCH}.
+name: surfra
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: utils
+maintainer: Surfra <support@surfra.io>
+description: Surfra supervisor. Runs your app in a container and connects it to Surfra.
+vendor: Surfra
+homepage: https://surfra.io
+license: Apache-2.0
+contents:
+  - src: dist/surfra-linux-${ARCH}
+    dst: /usr/bin/surfra
+    file_info:
+      mode: 0755

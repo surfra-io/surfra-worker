@@ -32,6 +32,17 @@ ENTRYPOINT ["surfra", "worker"]
 
 `SURFRA_VERSION=v0.2.0` pins a release. `SURFRA_INSTALL_DIR` changes where the binary goes. The script checks each download against the release's `checksums.txt`.
 
+Each release also has packages for amd64 and arm64 that install `/usr/bin/surfra`:
+
+```dockerfile
+# Debian and Ubuntu
+ARG TARGETARCH
+ADD https://github.com/surfra-io/surfra-worker/releases/download/v0.2.0/surfra_0.2.0_${TARGETARCH}.deb /tmp/surfra.deb
+RUN dpkg -i /tmp/surfra.deb && rm /tmp/surfra.deb
+```
+
+Fedora, RHEL, and Amazon Linux use `surfra-0.2.0-1.x86_64.rpm` or `surfra-0.2.0-1.aarch64.rpm` with `rpm -i`. Alpine uses `surfra_0.2.0_x86_64.apk` or `surfra_0.2.0_aarch64.apk` with `apk add --allow-untrusted`.
+
 ## Logs
 
 Every line your app writes to stdout or stderr is still printed to the container output, and is also kept with a UTC timestamp and, when Surfra can tell, the request it belongs to. Your app gets that request ID in the `X-Surfra-Request-Id` header. Lines are buffered on local disk, up to 5% of it, and sent about once a minute. `SURFRA_LOGS=0` turns this off.
