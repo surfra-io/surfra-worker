@@ -30,18 +30,18 @@ ENV SURFRA_ENTRYPOINT="python /app/server.py" SURFRA_HTTP_PORT=8000
 ENTRYPOINT ["surfra", "worker"]
 ```
 
-`SURFRA_VERSION=v0.2.0` pins a release. `SURFRA_INSTALL_DIR` changes where the binary goes. The script checks each download against the release's `checksums.txt`.
+`SURFRA_VERSION=v0.2.1` pins a release. `SURFRA_INSTALL_DIR` changes where the binary goes. The script checks each download against the release's `checksums.txt`.
 
 Each release also has packages for amd64 and arm64 that install `/usr/bin/surfra`:
 
 ```dockerfile
 # Debian and Ubuntu
 ARG TARGETARCH
-ADD https://github.com/surfra-io/surfra-worker/releases/download/v0.2.0/surfra_0.2.0_${TARGETARCH}.deb /tmp/surfra.deb
+ADD https://github.com/surfra-io/surfra-worker/releases/download/v0.2.1/surfra_0.2.1_${TARGETARCH}.deb /tmp/surfra.deb
 RUN dpkg -i /tmp/surfra.deb && rm /tmp/surfra.deb
 ```
 
-Fedora, RHEL, and Amazon Linux use `surfra-0.2.0-1.x86_64.rpm` or `surfra-0.2.0-1.aarch64.rpm` with `rpm -i`. Alpine uses `surfra_0.2.0_x86_64.apk` or `surfra_0.2.0_aarch64.apk` with `apk add --allow-untrusted`.
+Fedora, RHEL, and Amazon Linux use `surfra-0.2.1-1.x86_64.rpm` or `surfra-0.2.1-1.aarch64.rpm` with `rpm -i`. Alpine uses `surfra_0.2.1_x86_64.apk` or `surfra_0.2.1_aarch64.apk` with `apk add --allow-untrusted`.
 
 ## Logs
 
