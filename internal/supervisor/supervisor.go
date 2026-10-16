@@ -23,12 +23,21 @@ import (
 	"surfra.io/worker/internal/split"
 )
 
-var errStopped = errors.New("stopped")
+var (
+	errStopped = errors.New("stopped")
+	// errGone means Surfra stopped this replica. The container waits to be shut down instead of exiting,
+	// because a cloud restart policy would start it again with a token that no longer works.
+	errGone = errors.New("replica stopped by Surfra")
+)
 
 const (
-	stderrLimit = 32 * 1024
-	bodyLimit   = 8 << 20
-	liveMisses  = 3
+	stderrLimit  = 32 * 1024
+	bodyLimit    = 8 << 20
+	liveMisses   = 3
+	liveTimeout  = 5 * time.Second
+	planeGiveUp  = 5 * time.Minute
+	backoffFirst = time.Second
+	backoffMax   = 30 * time.Second
 )
 
 // Config is the contract the control plane injects. Users do not set these.
@@ -143,18 +152,98 @@ func Run(ctx context.Context, cfg Config) error {
 		s.boot(err.Error())
 		return err
 	}
-	if err := s.client.register(ctx); err != nil {
-		if errors.Is(err, context.Canceled) {
+	if err := s.register(ctx); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, errStopped) {
 			return nil
+		}
+		if errors.Is(err, errGone) {
+			return s.idle(ctx)
 		}
 		s.boot("register: " + err.Error())
 		return err
 	}
 	if err := s.loop(ctx); err != nil {
+		if errors.Is(err, errGone) {
+			return s.idle(ctx)
+		}
 		s.boot(err.Error())
 		return err
 	}
 	return nil
+}
+
+// register retries the control plane until it answers. Only a stopped replica or a refusal ends it.
+func (s *supervisor) register(ctx context.Context) error {
+	wait := backoffFirst
+	deadline := time.Now().Add(planeGiveUp)
+	for {
+		err := s.client.register(ctx)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return context.Canceled
+		}
+		if gone(err) {
+			return errGone
+		}
+		if !transient(err) || time.Now().After(deadline) {
+			return err
+		}
+		s.note("control plane unavailable, retrying register: " + err.Error())
+		if err := s.sleep(ctx, wait); err != nil {
+			return err
+		}
+		wait = min(wait*2, backoffMax)
+	}
+}
+
+// idle stops the app and waits for the container to be shut down.
+func (s *supervisor) idle(ctx context.Context) error {
+	s.stopChild()
+	s.note("Surfra stopped this replica. Waiting for the container to be shut down.")
+	<-ctx.Done()
+	return nil
+}
+
+func (s *supervisor) sleep(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return errStopped
+	case <-s.exited:
+		return fmt.Errorf("child exited: %s", s.tail.text())
+	case <-time.After(d):
+		return nil
+	}
+}
+
+// planeError is a non-2xx answer from the control plane.
+type planeError struct {
+	status int
+	text   string
+}
+
+func (e *planeError) Error() string {
+	return fmt.Sprintf("%d %s %s", e.status, http.StatusText(e.status), e.text)
+}
+
+// transient errors are worth retrying: the network, timeouts, rate limits, and 5xx.
+func transient(err error) bool {
+	var pe *planeError
+	if errors.As(err, &pe) {
+		return pe.status >= 500 || pe.status == http.StatusTooManyRequests || pe.status == http.StatusRequestTimeout
+	}
+	return true
+}
+
+func gone(err error) bool {
+	var pe *planeError
+	return errors.As(err, &pe) && pe.status == http.StatusUnauthorized && strings.Contains(pe.text, "unknown replica token")
+}
+
+func dropped(err error) bool {
+	var pe *planeError
+	return errors.As(err, &pe) && pe.status == http.StatusUnauthorized && strings.Contains(pe.text, "worker is not registered")
 }
 
 type supervisor struct {
@@ -340,7 +429,9 @@ func (s *supervisor) loop(ctx context.Context) error {
 	poll := time.NewTicker(s.cfg.PollInterval)
 	defer poll.Stop()
 	work, cancelWork := context.WithCancel(ctx)
-	defer cancelWork()
+	defer func() { cancelWork() }()
+	failing := time.Time{}
+	wait := backoffFirst
 
 	failRunning := func(reason string) {
 		mu.Lock()
@@ -388,7 +479,16 @@ func (s *supervisor) loop(ctx context.Context) error {
 			mu.Unlock()
 			if time.Since(lastLive) >= s.cfg.LiveInterval {
 				lastLive = time.Now()
-				if err := s.probe(&http.Client{Timeout: 2 * time.Second}, s.local(s.cfg.LivePath)); err != nil {
+				mu.Lock()
+				busy := len(inflight) > 0
+				mu.Unlock()
+				err := s.probe(&http.Client{Timeout: liveTimeout}, s.local(s.cfg.LivePath))
+				var netErr interface{ Timeout() bool }
+				// A busy app can answer health checks slowly. Only refusals and errors count then.
+				if err != nil && busy && errors.As(err, &netErr) && netErr.Timeout() {
+					err = nil
+				}
+				if err != nil {
 					misses++
 					if misses >= liveMisses {
 						cancelWork()
@@ -401,15 +501,57 @@ func (s *supervisor) loop(ctx context.Context) error {
 				}
 			}
 			stages, err := s.client.next(ctx, s.cfg.MaxOngoing)
+			if err != nil && ctx.Err() != nil {
+				cancelWork()
+				failRunning("worker stopped")
+				return nil
+			}
+			if err != nil && (gone(err) || dropped(err)) {
+				// Surfra already requeued what this worker held, so drop it and register again.
+				cancelWork()
+				mu.Lock()
+				inflight = map[string]*job{}
+				mu.Unlock()
+				if err := s.register(ctx); err != nil {
+					if errors.Is(err, errStopped) || errors.Is(err, context.Canceled) {
+						return nil
+					}
+					return err
+				}
+				s.note("registered again as " + s.client.worker)
+				work, cancelWork = context.WithCancel(ctx)
+				continue
+			}
+			if err != nil && transient(err) {
+				if failing.IsZero() {
+					failing = time.Now()
+				}
+				if time.Since(failing) > planeGiveUp {
+					cancelWork()
+					failRunning(err.Error())
+					return err
+				}
+				s.note("control plane unavailable, retrying: " + err.Error())
+				if err := s.sleep(ctx, wait); err != nil {
+					if errors.Is(err, errStopped) {
+						cancelWork()
+						failRunning("worker stopped")
+						return nil
+					}
+					cancelWork()
+					failRunning(err.Error())
+					return err
+				}
+				wait = min(wait*2, backoffMax)
+				continue
+			}
 			if err != nil {
 				cancelWork()
-				if ctx.Err() != nil {
-					failRunning("worker stopped")
-					return nil
-				}
 				failRunning(err.Error())
 				return err
 			}
+			failing = time.Time{}
+			wait = backoffFirst
 			var retry []stage
 			mu.Lock()
 			for _, stage := range stages {
@@ -772,7 +914,7 @@ func (p *plane) call(ctx context.Context, path string, body any, dest any) error
 		if len(text) > 300 {
 			text = text[:300]
 		}
-		return fmt.Errorf("%s %s", resp.Status, text)
+		return &planeError{status: resp.StatusCode, text: text}
 	}
 	if dest != nil && len(bytes.TrimSpace(data)) > 0 {
 		return json.Unmarshal(data, dest)

@@ -273,6 +273,10 @@ type fakeMaster struct {
 	boots     []string
 	bin       string
 	postLog   string
+	nextFails int
+	dropOnce  bool
+	gone      bool
+	registers int
 }
 
 func newFakeMaster(t *testing.T) *fakeMaster {
@@ -334,11 +338,38 @@ func (f *fakeMaster) serve(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	switch r.URL.Path {
 	case "/v1/workers/register":
+		f.mu.Lock()
+		f.registers++
+		gone := f.gone
+		f.mu.Unlock()
+		if gone {
+			http.Error(w, `{"detail":"unknown replica token"}`, http.StatusUnauthorized)
+			return
+		}
 		writeJSON(w, map[string]any{"worker_id": "sfw_test"})
 	case "/v1/workers/next":
 		f.mu.Lock()
 		open := f.open
+		fail := f.nextFails > 0
+		if fail {
+			f.nextFails--
+		}
+		drop := f.dropOnce
+		f.dropOnce = false
+		gone := f.gone
 		f.mu.Unlock()
+		if fail {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		if drop {
+			http.Error(w, `{"detail":"worker is not registered on this replica"}`, http.StatusUnauthorized)
+			return
+		}
+		if gone {
+			http.Error(w, `{"detail":"unknown replica token"}`, http.StatusUnauthorized)
+			return
+		}
 		if !open {
 			writeJSON(w, map[string]any{"stages": []any{}})
 			return
@@ -376,4 +407,78 @@ func (f *fakeMaster) serve(w http.ResponseWriter, r *http.Request) {
 func writeJSON(w http.ResponseWriter, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+func TestControlPlaneErrorsAreRetried(t *testing.T) {
+	master := newFakeMaster(t)
+	defer master.Close()
+	master.nextFails = 2
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, master.cfg("echo")) }()
+	select {
+	case <-master.completed:
+	case err := <-done:
+		t.Fatalf("worker exited on a 500 from the control plane: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("request never completed after the control plane recovered")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("expected a clean stop, got %v", err)
+	}
+	if len(master.boots) != 0 {
+		t.Fatalf("a transient error was reported as a boot failure: %v", master.boots)
+	}
+}
+
+func TestDroppedWorkerRegistersAgain(t *testing.T) {
+	master := newFakeMaster(t)
+	defer master.Close()
+	master.dropOnce = true
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, master.cfg("echo")) }()
+	select {
+	case <-master.completed:
+	case err := <-done:
+		t.Fatalf("worker exited instead of registering again: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("request never completed")
+	}
+	cancel()
+	<-done
+	master.mu.Lock()
+	defer master.mu.Unlock()
+	if master.registers != 2 {
+		t.Fatalf("registers = %d, want 2", master.registers)
+	}
+}
+
+func TestStoppedReplicaWaitsQuietly(t *testing.T) {
+	master := newFakeMaster(t)
+	defer master.Close()
+	master.gone = true
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, master.cfg("echo")) }()
+	select {
+	case err := <-done:
+		t.Fatalf("worker exited, so a restart policy would start it again: %v", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected nil on shutdown, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not stop on shutdown")
+	}
+	if len(master.boots) != 0 {
+		t.Fatalf("a stopped replica reported a boot failure: %v", master.boots)
+	}
 }
