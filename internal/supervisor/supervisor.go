@@ -53,6 +53,7 @@ type Config struct {
 	MaxOngoing   int
 	ExecTimeout  time.Duration
 	PollInterval time.Duration
+	PollWait     time.Duration
 	LiveInterval time.Duration
 	Env          []string
 	ShipLogs     bool
@@ -73,6 +74,7 @@ func FromEnv() (Config, error) {
 		MaxOngoing:   envInt("SURFRA_MAX_ONGOING", 4),
 		ExecTimeout:  time.Duration(envInt("SURFRA_EXECUTION_TIMEOUT", 1200)) * time.Second,
 		PollInterval: 2 * time.Second,
+		PollWait:     20 * time.Second,
 		LiveInterval: 10 * time.Second,
 		Env:          os.Environ(),
 		ShipLogs:     strings.TrimSpace(os.Getenv("SURFRA_LOGS")) != "0",
@@ -432,6 +434,7 @@ func (s *supervisor) loop(ctx context.Context) error {
 	defer func() { cancelWork() }()
 	failing := time.Time{}
 	wait := backoffFirst
+	full := false
 
 	failRunning := func(reason string) {
 		mu.Lock()
@@ -500,7 +503,24 @@ func (s *supervisor) loop(ctx context.Context) error {
 					misses = 0
 				}
 			}
-			stages, err := s.client.next(ctx, s.cfg.MaxOngoing)
+			// An idle poll waits on the server for work. A child exit ends the wait early.
+			pollCtx, cancelPoll := context.WithCancel(ctx)
+			go func() {
+				select {
+				case <-s.exited:
+					cancelPoll()
+				case <-pollCtx.Done():
+				}
+			}()
+			stages, err := s.client.next(pollCtx, s.cfg.MaxOngoing, s.cfg.PollWait, !full)
+			cancelPoll()
+			select {
+			case <-s.exited:
+				cancelWork()
+				failRunning("child exited: " + s.tail.text())
+				return fmt.Errorf("child exited: %s", s.tail.text())
+			default:
+			}
 			if err != nil && ctx.Err() != nil {
 				cancelWork()
 				failRunning("worker stopped")
@@ -553,9 +573,15 @@ func (s *supervisor) loop(ctx context.Context) error {
 			failing = time.Time{}
 			wait = backoffFirst
 			var retry []stage
+			full = false
 			mu.Lock()
 			for _, stage := range stages {
 				item := inflight[stage.ID]
+				if item == nil && stage.Held {
+					// Held without an input we know. The next poll asks for the full stage.
+					full = true
+					continue
+				}
 				if item == nil {
 					item = &job{phase: "run"}
 					inflight[stage.ID] = item
@@ -824,6 +850,7 @@ type stage struct {
 	ID            string          `json:"id"`
 	TransactionID string          `json:"transaction_id"`
 	Input         json.RawMessage `json:"input"`
+	Held          bool            `json:"held"`
 }
 
 type plane struct {
@@ -851,15 +878,22 @@ func (p *plane) register(ctx context.Context) error {
 	return nil
 }
 
-func (p *plane) next(ctx context.Context, limit int) ([]stage, error) {
+// next heartbeats and claims. wait lets an idle poll sit on the server until work
+// arrives. With ids, stages this worker already holds come back without inputs.
+func (p *plane) next(ctx context.Context, limit int, wait time.Duration, ids bool) ([]stage, error) {
 	var out struct {
 		Stages []stage `json:"stages"`
 	}
-	err := p.call(ctx, "/v1/workers/next", map[string]any{
+	body := map[string]any{
 		"replica_token": p.token,
 		"worker_id":     p.worker,
 		"limit":         limit,
-	}, &out)
+		"wait":          wait.Seconds(),
+	}
+	if ids {
+		body["held"] = "ids"
+	}
+	err := p.call(ctx, "/v1/workers/next", body, &out)
 	return out.Stages, err
 }
 
@@ -905,7 +939,8 @@ func (p *plane) call(ctx context.Context, path string, body any, dest any) error
 		return err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	// A claim can carry up to limit inputs of 1 MB each.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 80<<20))
 	if err != nil {
 		return err
 	}
