@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 
 	"surfra.io/worker/internal/logs"
 	"surfra.io/worker/internal/split"
+	"surfra.io/worker/internal/usage"
 )
 
 var (
@@ -58,6 +60,7 @@ type Config struct {
 	Env          []string
 	ShipLogs     bool
 	LogDir       string
+	Usage        bool
 }
 
 // FromEnv reads the baked worker environment.
@@ -79,6 +82,7 @@ func FromEnv() (Config, error) {
 		Env:          os.Environ(),
 		ShipLogs:     strings.TrimSpace(os.Getenv("SURFRA_LOGS")) != "0",
 		LogDir:       strings.TrimSpace(os.Getenv("SURFRA_LOG_DIR")),
+		Usage:        !slices.Contains([]string{"0", "false", "no", "off"}, strings.ToLower(strings.TrimSpace(os.Getenv("SURFRA_USAGE")))),
 	}
 	if cfg.Master == "" || cfg.Token == "" || cfg.Entrypoint == "" {
 		return Config{}, fmt.Errorf("this process is started with SURFRA_MASTER, SURFRA_REPLICA_TOKEN, and SURFRA_ENTRYPOINT")
@@ -163,6 +167,11 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		s.boot("register: " + err.Error())
 		return err
+	}
+	if s.cfg.Usage {
+		metered, stopMeter := context.WithCancel(ctx)
+		defer stopMeter()
+		go usage.New().Loop(metered, s.client.usage)
 	}
 	if err := s.loop(ctx); err != nil {
 		if errors.Is(err, errGone) {
@@ -922,6 +931,11 @@ func (p *plane) boot(ctx context.Context, message string) error {
 		"replica_token": p.token,
 		"message":       message,
 	}, nil)
+}
+
+// usage reports a minute of utilization. A failed report is dropped; the next one replaces it.
+func (p *plane) usage(ctx context.Context, sample usage.Aggregate) {
+	_ = p.call(ctx, "/v1/workers/usage", map[string]any{"replica_token": p.token, "sample": sample}, nil)
 }
 
 func (p *plane) call(ctx context.Context, path string, body any, dest any) error {
