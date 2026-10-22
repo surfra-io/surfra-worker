@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"surfra.io/worker/internal/job"
 	"surfra.io/worker/internal/supervisor"
 )
 
@@ -26,6 +27,12 @@ func main() {
 		fmt.Println(version)
 	case "worker":
 		runWorker()
+	case "job":
+		if len(os.Args) < 3 || os.Args[2] != "agent" {
+			usage()
+			os.Exit(2)
+		}
+		runJobAgent()
 	default:
 		usage()
 		os.Exit(2)
@@ -46,6 +53,16 @@ func runWorker() {
 	}
 }
 
+func runJobAgent() {
+	cfg, err := job.FromEnv()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	// The agent handles SIGTERM and SIGINT itself: it stops the command, then reports how it ended.
+	os.Exit(job.Run(context.Background(), cfg))
+}
+
 func usage() {
-	fmt.Fprintf(os.Stderr, "surfra %s\nusage: surfra worker\n       surfra version\n", version)
+	fmt.Fprintf(os.Stderr, "surfra %s\nusage: surfra worker\n       surfra job agent\n       surfra version\n", version)
 }

@@ -243,6 +243,14 @@ func (s *Shipper) Run(ctx context.Context) {
 	}
 }
 
+// Kick sends what is buffered now instead of at the next interval.
+func (s *Shipper) Kick() {
+	select {
+	case s.kick <- struct{}{}:
+	default:
+	}
+}
+
 // Flush sends every batch on disk, oldest first, and stops at the first failure.
 func (s *Shipper) Flush(ctx context.Context) {
 	s.mu.Lock()

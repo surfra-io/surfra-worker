@@ -23,6 +23,7 @@ import (
 	"surfra.io/worker/internal/logs"
 	"surfra.io/worker/internal/split"
 	"surfra.io/worker/internal/usage"
+	"surfra.io/worker/internal/volumes"
 )
 
 var (
@@ -146,14 +147,8 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	defer s.stopLogs()
-	volumes := newVolumeTokens(cfg)
-	s.cfg.Env = volumes.env(s.cfg.Env)
-	first, cancelFirst := context.WithTimeout(ctx, 10*time.Second)
-	_ = volumes.refresh(first)
-	cancelFirst()
-	tokens, stopTokens := context.WithCancel(ctx)
-	defer stopTokens()
-	go volumes.loop(tokens)
+	stopVolumes := s.startVolumes(ctx)
+	defer stopVolumes()
 	if err := s.start(); err != nil {
 		s.boot(err.Error())
 		return err
@@ -999,4 +994,20 @@ func (t *tail) text() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return strings.TrimSpace(string(t.buf))
+}
+
+// startVolumes gives the app volumes access without the replica token: a loopback proxy at
+// SURFRA_VOLUMES_URL that adds a volumes-only token, and the token in SURFRA_VOLUMES_TOKEN_FILE.
+func (s *supervisor) startVolumes(ctx context.Context) func() {
+	tokens := volumes.New(s.cfg.Master, s.cfg.Token, s.cfg.Env)
+	first, cancelFirst := context.WithTimeout(ctx, 10*time.Second)
+	_ = tokens.Refresh(first)
+	cancelFirst()
+	running, stop := context.WithCancel(ctx)
+	if err := tokens.Serve(running); err != nil {
+		s.note("volumes proxy did not start: " + err.Error())
+	}
+	s.cfg.Env = tokens.Env(s.cfg.Env)
+	go tokens.Loop(running)
+	return stop
 }
