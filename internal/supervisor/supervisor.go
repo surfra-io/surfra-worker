@@ -146,6 +146,14 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	defer s.stopLogs()
+	volumes := newVolumeTokens(cfg)
+	s.cfg.Env = volumes.env(s.cfg.Env)
+	first, cancelFirst := context.WithTimeout(ctx, 10*time.Second)
+	_ = volumes.refresh(first)
+	cancelFirst()
+	tokens, stopTokens := context.WithCancel(ctx)
+	defer stopTokens()
+	go volumes.loop(tokens)
 	if err := s.start(); err != nil {
 		s.boot(err.Error())
 		return err

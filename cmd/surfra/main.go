@@ -10,7 +10,7 @@ import (
 	"surfra.io/worker/internal/supervisor"
 )
 
-var version = "0.2.3"
+var version = "0.2.4"
 
 func main() {
 	// Clouds that take a command append "surfra worker" after the image entrypoint.
